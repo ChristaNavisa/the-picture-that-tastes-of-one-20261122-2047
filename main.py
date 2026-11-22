@@ -1,271 +1,351 @@
-#!/usr/bin/env python3
-"""Macro honeycomb: the picture that tastes of one ingredient (honey).
+"""Honeycomb macro: the picture that tastes of one ingredient (honey).
 
-Stdlib-only procedural renderer. Renders a deterministic 1024x1024 PNG
-of a golden honeycomb macro: organic irregular wax cells filled with
-glossy honey, a thick honey drip with a droplet, and a pooled honey gloss
-at the base. One ingredient, one picture.
-Writes $MAKEFUN_OUTPUT_DIR/entry.png (default /output/entry.png).
+Renders a deterministic 1024x1024 macro photograph-style image of a honeycomb
+dripping golden honey, using only the Python standard library. The image is
+built at 512x512 (organic irregular hex cells, a glossy honey pool, a honey
+drip strand and droplet, warm directional light, radial depth of field and a
+vignette), then upscaled 2x with bilinear filtering and written as a PNG
+(Sub filter, zlib level 9) to $MAKEFUN_OUTPUT_DIR/entry.png (or /output).
 """
+
 import math
 import os
 import struct
 import zlib
 
-W = 1024
-H = 1024
-HEX = 68.0
-INV_HEX = 1.0 / HEX
-SQ3 = 1.7320508075688772
-SQ3_3 = SQ3 / 3.0
-THIRD = 1.0 / 3.0
-TWO_THIRDS = 2.0 / 3.0
+BASE = 512          # render resolution, upscaled 2x to 1024
+OUT = 1024
+HEX_R = 17.0        # hex cell radius in base pixels
+SQ3 = math.sqrt(3.0)
 
 
-def _h01(a, b):
-    h = (a * 374761393 + b * 668265263) & 0xFFFFFFFF
-    h = ((h ^ (h >> 13)) * 1274126177) & 0xFFFFFFFF
-    h ^= h >> 16
-    return (h & 0xFFFFFF) / 16777216.0
+def frand(q, r, salt):
+    """Deterministic pseudo-random float in [0, 1) from integer cell coords."""
+    x = (q * 374761393 + r * 668265263 + salt * 974634211) & 0xFFFFFFFF
+    x ^= (x >> 13)
+    x = (x * 1274126177) & 0xFFFFFFFF
+    x ^= (x >> 16)
+    return (x & 0xFFFFFFFF) / 4294967296.0
 
 
-def _chunk(typ, data):
-    out = struct.pack(">I", len(data)) + typ + data
-    out += struct.pack(">I", zlib.crc32(typ + data) & 0xFFFFFFFF)
+def clamp(v, a=0.0, b=1.0):
+    return a if v < a else (b if v > b else v)
+
+
+def lerp(a, b, t):
+    return a + (b - a) * t
+
+
+def mix(c1, c2, t):
+    return (lerp(c1[0], c2[0], t), lerp(c1[1], c2[1], t), lerp(c1[2], c2[2], t))
+
+
+def smoothstep(a, b, x):
+    t = clamp((x - a) / (b - a))
+    return t * t * (3.0 - 2.0 * t)
+
+
+def hex_round(q, r):
+    """Round fractional axial coords to the nearest hex cell (cube rounding)."""
+    x = q
+    z = r
+    y = -x - z
+    rx = round(x)
+    ry = round(y)
+    rz = round(z)
+    dx = abs(rx - x)
+    dy = abs(ry - y)
+    dz = abs(rz - z)
+    if dx > dy and dx > dz:
+        rx = -ry - rz
+    elif dy > dz:
+        ry = -rx - rz
+    else:
+        rz = -rx - ry
+    return rx, rz
+
+
+def cell_center(q, r):
+    cx = HEX_R * SQ3 * (q + r * 0.5)
+    cy = HEX_R * 1.5 * r
+    return cx, cy
+
+
+# --- palette (linear-ish 0..1 RGB) -------------------------------------------
+WALL_DARK = (0.34, 0.20, 0.05)
+WALL_LITE = (0.62, 0.40, 0.12)
+HONEY_DEEP = (0.58, 0.30, 0.04)
+HONEY_MID = (0.86, 0.55, 0.12)
+HONEY_BRITE = (0.98, 0.74, 0.28)
+WAX_PALE = (0.95, 0.80, 0.48)
+WAX_MID = (0.87, 0.66, 0.30)
+EMPTY_DARK = (0.16, 0.09, 0.03)
+EMPTY_MID = (0.30, 0.18, 0.07)
+POOL_DEEP = (0.52, 0.26, 0.03)
+POOL_BRITE = (0.97, 0.64, 0.16)
+SPEC = (1.0, 0.94, 0.78)
+
+
+def cell_color(q, r, px, py):
+    """Colour of base pixel (px, py) from its honeycomb cell."""
+    # fractional axial coords of the pixel
+    fq = (SQ3 / 3.0 * px - py / 3.0) / HEX_R
+    fr = (2.0 / 3.0 * py) / HEX_R
+    cq, cr = hex_round(fq, fr)
+    cx, cy = cell_center(cq, cr)
+    # offset from cell centre, in hex-local units
+    dx = px - cx
+    dy = py - cy
+    u = (SQ3 / 3.0 * dx - dy / 3.0) / HEX_R
+    v = (2.0 / 3.0 * dy) / HEX_R
+    hdist = max(abs(u), abs(v), abs(u + v))
+
+    kind = frand(cq, cr, 0)          # cell type
+    tint = frand(cq, cr, 1)          # amber variation
+    inner = 0.72 + 0.20 * frand(cq, cr, 2)   # inner surface radius
+    wob = frand(cq, cr, 3) * 6.283185307
+
+    if hdist > 1.0:
+        # outside this cell (should not happen for the rounded cell, but
+        # keep a safe fallback): dark wall
+        return WALL_DARK
+    if hdist > inner:
+        # wax wall between cells; a faint top highlight
+        t = (hdist - inner) / (1.0 - inner)
+        col = mix(WALL_LITE, WALL_DARK, clamp(t * 1.4))
+        edge = smoothstep(0.55, 0.0, abs(dy - (-HEX_R * 0.55)) / HEX_R)
+        return mix(col, WALL_LITE, edge * 0.25)
+
+    # inside the cell's surface; local coords for gloss (-1..1)
+    lx = clamp(dx / (HEX_R * inner))
+    ly = clamp(dy / (HEX_R * inner))
+    if kind < 0.55:
+        # open honey: glossy amber, brighter toward the light
+        base = mix(HONEY_DEEP, HONEY_MID, 0.35 + 0.55 * tint)
+        base = mix(base, HONEY_BRITE, 0.25 * max(0.0, 1.0 - (lx * lx + ly * ly)))
+        # specular gloss spot, offset toward the upper-left light
+        gx = lx + 0.32
+        gy = ly + 0.38
+        gd = math.sqrt(gx * gx + gy * gy)
+        spec = math.pow(max(0.0, 1.0 - gd / 0.85), 2.5) * 0.55
+        # gentle swirl inside the honey
+        sw = 0.05 * math.sin((lx * 2.0 + ly * 1.5) * 3.0 + wob)
+        col = mix(base, HONEY_BRITE, clamp(sw + 0.12))
+        return mix(col, SPEC, spec)
+    if kind < 0.85:
+        # capped wax: pale matte gold, soft sheen
+        base = mix(WAX_MID, WAX_PALE, 0.3 + 0.6 * tint)
+        sheen = math.pow(max(0.0, 1.0 - ((lx + 0.3) ** 2 + (ly + 0.35) ** 2)), 2.0)
+        return mix(base, SPEC, sheen * 0.22)
+    # empty cell: dark, shadowed, faint rim light at the bottom
+    base = mix(EMPTY_DARK, EMPTY_MID, 0.3 + 0.5 * tint)
+    rim = smoothstep(0.45, 1.0, ly) * 0.35
+    return mix(base, WALL_LITE, rim)
+
+
+def pool_color(px, py):
+    """Glossy honey pool at the bottom; returns (colour, mask)."""
+    pcx = 0.52 * BASE
+    pcy = 0.88 * BASE
+    prx = 0.47 * BASE
+    pry = 0.30 * BASE
+    dx = (px - pcx) / prx
+    dy = (py - pcy) / pry
+    d = math.sqrt(dx * dx + dy * dy)
+    mask = 1.0 - smoothstep(0.90, 1.0, d)
+    if mask <= 0.0:
+        return (0.0, 0.0, 0.0), 0.0
+    ang = math.atan2(dy, dx)
+    swirl = 0.5 + 0.5 * math.sin(ang * 3.0 + d * 7.0)
+    col = mix(POOL_DEEP, POOL_BRITE, 0.30 + 0.45 * swirl * (1.0 - d * 0.45))
+    # elongated specular highlight near the pool's upper-left
+    sx = (px - 0.44 * BASE) / (0.16 * BASE)
+    sy = (py - 0.80 * BASE) / (0.07 * BASE)
+    spec = math.exp(-(sx * sx + sy * sy)) * 0.75
+    col = mix(col, SPEC, spec)
+    return col, mask
+
+
+def drip_color(px, py):
+    """Honey drip strand from the top plus a droplet; returns (colour, mask)."""
+    dx = 0.60 * BASE
+    # strand: narrow vertical band from the top edge down
+    if py < 0.36 * BASE:
+        half = 3.2 + 1.5 * math.sin(py * 0.09)
+        off = abs(px - dx)
+        if off < half:
+            edge = 1.0 - off / half
+            col = mix(HONEY_DEEP, HONEY_BRITE, 0.35 + 0.45 * edge)
+            col = mix(col, SPEC, math.pow(edge, 3.0) * 0.5)
+            return col, smoothstep(half, half * 0.55, off)
+    # droplet hanging at the strand's end
+    dcx = dx
+    dcy = 0.385 * BASE
+    dr = 17.0
+    ddx = px - dcx
+    ddy = py - dcy
+    dist = math.sqrt(ddx * ddx + ddy * ddy)
+    if dist < dr:
+        t = dist / dr
+        col = mix(HONEY_BRITE, HONEY_DEEP, t * 0.85)
+        # bright specular dot, upper-left of the droplet
+        sdx = (px - (dcx - 6.0)) / 5.0
+        sdy = (py - (dcy - 7.0)) / 5.0
+        spec = math.exp(-(sdx * sdx + sdy * sdy)) * 0.9
+        col = mix(col, SPEC, spec)
+        return col, 1.0 - smoothstep(dr * 0.82, dr, dist)
+    return (0.0, 0.0, 0.0), 0.0
+
+
+def render_base():
+    """Render the 512x512 base image as a flat list of (r, g, b) floats."""
+    img = [None] * (BASE * BASE)
+    for y in range(BASE):
+        row = y * BASE
+        # warm directional light: brighter toward the upper-left
+        for x in range(BASE):
+            col = cell_color_at(x, y)
+            pcol, pmask = pool_color(x, y)
+            if pmask > 0.0:
+                col = mix(col, pcol, pmask)
+            dcol, dmask = drip_color(x, y)
+            if dmask > 0.0:
+                col = mix(col, dcol, dmask)
+            light = 0.90 + 0.20 * (1.0 - (x + y) / float(BASE + BASE))
+            img[row + x] = (col[0] * light, col[1] * light, col[2] * light)
+    return img
+
+
+def cell_color_at(x, y):
+    return cell_color(0, 0, x, y)
+
+
+def box_blur(img, radius=2):
+    """Separable box blur over a flat list of (r, g, b) floats."""
+    w = BASE
+    h = BASE
+    tmp = [None] * (w * h)
+    # horizontal pass
+    for y in range(h):
+        row = y * w
+        for x in range(w):
+            sr = sg = sb = 0.0
+            n = 0
+            for k in range(-radius, radius + 1):
+                xx = x + k
+                if 0 <= xx < w:
+                    c = img[row + xx]
+                    sr += c[0]
+                    sg += c[1]
+                    sb += c[2]
+                    n += 1
+            tmp[row + x] = (sr / n, sg / n, sb / n)
+    out = [None] * (w * h)
+    # vertical pass
+    for y in range(h):
+        for x in range(w):
+            sr = sg = sb = 0.0
+            n = 0
+            for k in range(-radius, radius + 1):
+                yy = y + k
+                if 0 <= yy < h:
+                    c = tmp[yy * w + x]
+                    sr += c[0]
+                    sg += c[1]
+                    sb += c[2]
+                    n += 1
+            out[y * w + x] = (sr / n, sg / n, sb / n)
     return out
 
 
-def _write_png(path, w, h, rgb):
+def apply_dof_vignette(img, blurred):
+    """Blend toward the blurred copy away from the centre, then vignette."""
+    cx = BASE * 0.5
+    cy = BASE * 0.5
+    maxr = math.sqrt(cx * cx + cy * cy)
+    for y in range(BASE):
+        row = y * BASE
+        for x in range(BASE):
+            dx = (x - cx) / maxr
+            dy = (y - cy) / maxr
+            r = math.sqrt(dx * dx + dy * dy)
+            amt = clamp((r - 0.30) / 0.60, 0.0, 1.0) * 0.70
+            a = img[row + x]
+            b = blurred[row + x]
+            col = mix(a, b, amt)
+            vig = 1.0 - 0.30 * r * r
+            img[row + x] = (col[0] * vig, col[1] * vig, col[2] * vig)
+    return img
+
+
+def upscale_bilinear(img):
+    """Upscale the 512 base image to 1024x1024, return a bytearray of RGB."""
+    out = bytearray(OUT * OUT * 3)
+    for y in range(OUT):
+        sy = (y + 0.5) / 2.0 - 0.5
+        y0 = int(math.floor(sy))
+        y1 = y0 + 1
+        fy = sy - y0
+        y0 = 0 if y0 < 0 else (BASE - 1 if y0 > BASE - 1 else y0)
+        y1 = 0 if y1 < 0 else (BASE - 1 if y1 > BASE - 1 else y1)
+        for x in range(OUT):
+            sx = (x + 0.5) / 2.0 - 0.5
+            x0 = int(math.floor(sx))
+            x1 = x0 + 1
+            fx = sx - x0
+            x0 = 0 if x0 < 0 else (BASE - 1 if x0 > BASE - 1 else x0)
+            x1 = 0 if x1 < 0 else (BASE - 1 if x1 > BASE - 1 else x1)
+            c00 = img[y0 * BASE + x0]
+            c10 = img[y0 * BASE + x1]
+            c01 = img[y1 * BASE + x0]
+            c11 = img[y1 * BASE + x1]
+            r = lerp(lerp(c00[0], c10[0], fx), lerp(c01[0], c11[0], fx), fy)
+            g = lerp(lerp(c00[1], c10[1], fx), lerp(c01[1], c11[1], fx), fy)
+            b = lerp(lerp(c00[2], c10[2], fx), lerp(c01[2], c11[2], fx), fy)
+            i = (y * OUT + x) * 3
+            out[i] = int(clamp(r) * 255.0 + 0.5)
+            out[i + 1] = int(clamp(g) * 255.0 + 0.5)
+            out[i + 2] = int(clamp(b) * 255.0 + 0.5)
+    return out
+
+
+def png_bytes(rgb, w, h):
+    """Encode RGB bytes as a PNG (colour type 2, Sub filter, zlib level 9)."""
     raw = bytearray()
     stride = w * 3
     for y in range(h):
-        raw.append(0)
-        raw += rgb[y * stride:(y + 1) * stride]
+        raw.append(1)  # Sub filter
+        row = rgb[y * stride:(y + 1) * stride]
+        for i in range(stride):
+            left = row[i - 3] if i >= 3 else 0
+            raw.append((row[i] - left) & 0xFF)
+
+    def chunk(ctype, data):
+        c = struct.pack(">I", len(data)) + ctype + data
+        c += struct.pack(">I", zlib.crc32(ctype + data) & 0xFFFFFFFF)
+        return c
+
     ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
-    data = b"\x89PNG\r\n\x1a\n"
-    data += _chunk(b"IHDR", ihdr)
-    data += _chunk(b"IDAT", zlib.compress(bytes(raw), 9))
-    data += _chunk(b"IEND", b"")
-    with open(path, "wb") as f:
-        f.write(data)
-
-
-def render():
-    sq3 = SQ3
-    sq3_3 = SQ3_3
-    third = THIRD
-    two_thirds = TWO_THIRDS
-    inv_hex = INV_HEX
-    hexs = HEX
-    h01 = _h01
-    # organic warp of the comb (precomputed per row / column)
-    row_dx = [5.0 * math.sin(y * 0.011 + 0.7) + 3.0 * math.sin(y * 0.023 + 2.1)
-              for y in range(H)]
-    col_dy = [5.0 * math.sin(x * 0.009 + 1.3) + 3.0 * math.sin(x * 0.027 + 0.4)
-              for x in range(W)]
-    # wavy top edge of the honey pool at the base
-    pool_top = [800.0 + 18.0 * math.sin(x * 0.008) + 10.0 * math.sin(x * 0.021 + 2.0)
-                for x in range(W)]
-    # honey strand centre (wobbles as it falls)
-    strand_cx = [512.0 + 14.0 * math.sin(y * 0.011) + 6.0 * math.sin(y * 0.027 + 1.0)
-                 for y in range(H)]
-    dropx = strand_cx[430]
-    buf = bytearray(W * H * 3)
-    idx = 0
-    for y in range(H):
-        dxr = row_dx[y]
-        sx = strand_cx[y]
-        in_pool_row = y > 770
-        top_light = 1.0 + 0.10 * (1.0 - y / 1024.0)
-        for x in range(W):
-            # ---- honeycomb cell (warped coords) ----
-            xd = x + dxr
-            yd = y + col_dy[x]
-            q = (sq3_3 * xd - third * yd) * inv_hex
-            r_ = two_thirds * yd * inv_hex
-            cx_ = q
-            cz_ = r_
-            cy_ = -cx_ - cz_
-            rx = round(cx_)
-            ry = round(cy_)
-            rz = round(cz_)
-            ddx = abs(rx - cx_)
-            ddy = abs(ry - cy_)
-            ddz = abs(rz - cz_)
-            if ddx > ddy and ddx > ddz:
-                rx = -ry - rz
-            elif ddy > ddz:
-                ry = -rx - rz
-            else:
-                rz = -rx - ry
-            ccx = hexs * sq3 * (rx + rz * 0.5)
-            ccy = hexs * 1.5 * rz
-            lx = xd - ccx
-            ly = yd - ccy
-            u = (sq3_3 * lx - third * ly) * inv_hex
-            v = two_thirds * ly * inv_hex
-            w_ = -u - v
-            au = abs(u)
-            av = abs(v)
-            aw = abs(w_)
-            d = au if au >= av else av
-            if aw > d:
-                d = aw
-            h1 = h01(rx, rz)
-            h2 = h01(rx + 7919, rz + 104729)
-            wall_t = 0.74 + h2 * 0.08
-            tint = 0.92 + h1 * 0.16
-            # honey interior: glossy amber, brighter at the dome centre
-            depth = d / wall_t
-            if depth > 1.0:
-                depth = 1.0
-            lg = 1.0 + (lx * -0.35 + ly * -0.55) / hexs
-            if lg < 0.55:
-                lg = 0.55
-            elif lg > 1.35:
-                lg = 1.35
-            br = 1.18 - 0.38 * depth
-            hx = lx + 0.32 * hexs
-            hy = ly + 0.38 * hexs
-            hd2 = (hx * hx + hy * hy) / (hexs * hexs)
-            spec = 0.0
-            if hd2 < 0.16:
-                spec = (1.0 - hd2 / 0.16) * 0.85
-            hr_ = 205.0 * br * lg * tint + spec * 95.0
-            hg_ = 132.0 * br * lg * tint + spec * 62.0
-            hb_ = 22.0 * br * lg * tint + spec * 14.0
-            # wax wall: pale creamy gold, light from upper-left
-            wl = 1.0 + (lx * -0.30 + ly * -0.50) / hexs
-            if wl < 0.70:
-                wl = 0.70
-            elif wl > 1.20:
-                wl = 1.20
-            rim = 1.0
-            if d > 0.93:
-                rim = 1.0 - (d - 0.93) / 0.07 * 0.25
-            wt = 0.94 + h1 * 0.12
-            wr_ = 243.0 * wl * rim * wt
-            wg_ = 212.0 * wl * rim * wt
-            wb_ = 136.0 * wl * rim * wt
-            if d < wall_t - 0.02:
-                rr = hr_
-                gg = hg_
-                bb = hb_
-            elif d > wall_t + 0.02:
-                rr = wr_
-                gg = wg_
-                bb = wb_
-            else:
-                t = (d - wall_t + 0.02) / 0.04
-                t = t * t * (3.0 - 2.0 * t)
-                rr = hr_ + (wr_ - hr_) * t
-                gg = hg_ + (wg_ - hg_) * t
-                bb = hb_ + (wb_ - hb_) * t
-            # ---- honey pool at the base ----
-            if in_pool_row and y > pool_top[x]:
-                sw = (math.sin(x * 0.03 + y * 0.02 + 1.0) * 0.08
-                      + math.sin((x + y) * 0.015) * 0.05)
-                ex = (x - 620.0) / 180.0
-                ey = (y - 905.0) / 95.0
-                e2 = ex * ex + ey * ey
-                ps = 0.0
-                if e2 < 1.0:
-                    ps = (1.0 - e2) * 0.85
-                rr = 165.0 * (1.0 + sw) + ps * 95.0
-                gg = 94.0 * (1.0 + sw) + ps * 62.0
-                bb = 10.0 * (1.0 + sw) + ps * 15.0
-                if y < pool_top[x] + 3.0:
-                    rr += 45.0
-                    gg += 30.0
-                    bb += 8.0
-            # ---- drip strand + droplet ----
-            if y < 470:
-                if y < 430:
-                    sdx = x - sx
-                    if -13.0 < sdx < 13.0:
-                        hlx = x - (sx - 6.0)
-                        hsp = 0.0
-                        if -6.0 < hlx < 6.0:
-                            hsp = (1.0 - (hlx * hlx) / 36.0) * 0.8
-                        edge = 1.0
-                        if abs(sdx) > 10.0:
-                            edge = 0.85
-                        rr = (206.0 + hsp * 90.0) * edge
-                        gg = (131.0 + hsp * 58.0) * edge
-                        bb = (21.0 + hsp * 14.0) * edge
-                if 400 <= y <= 490:
-                    ddx2 = x - dropx
-                    ddy2 = y - 445.0
-                    dd2 = ddx2 * ddx2 + ddy2 * ddy2
-                    if dd2 < 1764.0:
-                        sdx = x - (dropx - 14.0)
-                        sdy = y - 429.0
-                        sd2 = sdx * sdx + sdy * sdy
-                        sp = 0.0
-                        if sd2 < 196.0:
-                            sp = (1.0 - sd2 / 196.0) * 0.95
-                        shade = 1.0
-                        if y > 462.0:
-                            shade = 0.82
-                        rr = (212.0 + sp * 95.0) * shade
-                        gg = (136.0 + sp * 62.0) * shade
-                        bb = (24.0 + sp * 15.0) * shade
-                        if dd2 > 1500.0:
-                            rr += 30.0
-                            gg += 20.0
-                            bb += 5.0
-            # ---- global light, focus falloff, vignette, grain ----
-            rr *= top_light
-            gg *= top_light
-            bb *= top_light
-            fdx = x - 512.0
-            fdy = y - 420.0
-            f2 = (fdx * fdx + fdy * fdy) / 577600.0
-            if f2 > 1.0:
-                f2 = 1.0
-            blur = f2 * 0.45
-            if blur > 0.0:
-                rr = rr * (1.0 - blur) + 200.0 * blur
-                gg = gg * (1.0 - blur) + 140.0 * blur
-                bb = bb * (1.0 - blur) + 42.0 * blur
-            nx = (x - 512.0) / 512.0
-            ny = (y - 512.0) / 512.0
-            r2 = nx * nx + ny * ny
-            if r2 > 0.45:
-                vig = 1.0 - 0.32 * (r2 - 0.45)
-                if vig < 0.55:
-                    vig = 0.55
-                rr *= vig
-                gg *= vig
-                bb *= vig
-            # (no per-pixel grain: random noise is incompressible and
-            # would push the PNG past the 1 MiB cap)
-            if rr < 0.0:
-                rr = 0.0
-            elif rr > 255.0:
-                rr = 255.0
-            if gg < 0.0:
-                gg = 0.0
-            elif gg > 255.0:
-                gg = 255.0
-            if bb < 0.0:
-                bb = 0.0
-            elif bb > 255.0:
-                bb = 255.0
-            buf[idx] = int(rr)
-            buf[idx + 1] = int(gg)
-            buf[idx + 2] = int(bb)
-            idx += 3
-    return buf
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+        + chunk(b"IEND", b"")
+    )
 
 
 def main():
     out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
     os.makedirs(out_dir, exist_ok=True)
+    img = render_base()
+    blurred = box_blur(img, radius=2)
+    img = apply_dof_vignette(img, blurred)
+    rgb = upscale_bilinear(img)
+    data = png_bytes(rgb, OUT, OUT)
     path = os.path.join(out_dir, "entry.png")
-    rgb = render()
-    _write_png(path, W, H, rgb)
-    print("wrote %s (%d bytes, %dx%d)" % (path, os.path.getsize(path), W, H))
+    with open(path, "wb") as f:
+        f.write(data)
+    print("wrote %s (%d bytes, %dx%d)" % (path, len(data), OUT, OUT))
 
 
 if __name__ == "__main__":
